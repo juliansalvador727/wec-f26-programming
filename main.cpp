@@ -84,14 +84,11 @@ class Controller {
 
         auto isLastHour() const -> bool { return hour_ == config::hours_per_day - 1; }
 
-        auto shouldUseBattery(const HourState& state) const -> bool {
+        auto batteryBudget(const HourState& state) const -> double {
             auto event{state.event};
-            auto price{state.grid_price};
-            if (event == Event::BatteryFailure) return false;
-            if (event == Event::GridFailure) return true;
-            if (isLastHour()) return true;
-            if (event == Event::GeneratorFailure) return false;
-            return price > config::generator_cost;
+            if (event == Event::BatteryFailure) return 0.0;
+            if (event == Event::GridFailure || isLastHour()) return battery_charge_;
+            return 0.0;
         }
 
         auto shouldRecharge(const HourState& state) const -> bool {
@@ -110,13 +107,10 @@ class Controller {
             auto event{state.event};
 
             auto solar_left{config::solar_per_hour};
-            auto battery_left{battery_charge_};
+            auto battery_left{batteryBudget(state)};
 
             if (event == Event::Cloudy) {
                 solar_left = 0.0;
-            }
-            if (!shouldUseBattery(state)) {
-                battery_left = 0.0;
             }
 
             HourPlan plan;
@@ -259,12 +253,25 @@ public:
 
 bool parse(const std::string& text, Value& result) { return Parser(text).parse(result); }
 
-Event eventFromString(const std::string& name) {
-    if (name == "cloudy_weather") return Event::Cloudy;
-    if (name == "generator_failure") return Event::GeneratorFailure;
-    if (name == "battery_failure") return Event::BatteryFailure;
-    if (name == "grid_failure") return Event::GridFailure;
-    if (name != "none") std::cerr << "WARNING: unknown event '" << name << "'\n";
+std::string allText(const Value& value) {
+    std::string text = value.text;
+    for (const Value& item : value.items) text += " " + allText(item);
+    for (const auto& field : value.fields) text += " " + allText(field.second);
+    return text;
+}
+
+bool contains(const std::string& text, const std::string& word) {
+    return text.find(word) != std::string::npos;
+}
+
+// match on keywords
+Event eventFromString(std::string name) {
+    for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (contains(name, "cloud") || contains(name, "solar")) return Event::Cloudy;
+    if (contains(name, "generator")) return Event::GeneratorFailure;
+    if (contains(name, "batter")) return Event::BatteryFailure;
+    if (contains(name, "grid")) return Event::GridFailure;
+    if (!name.empty() && !contains(name, "none")) std::cerr << "WARNING: unknown event '" << name << "'\n";
     return Event::None;
 }
 
@@ -282,8 +289,9 @@ BuildingType buildingTypeFromString(const std::string& name) {
 // turns one server message into the controller's input
 HourState toHourState(const Value& message) {
     HourState state;
-    state.event = eventFromString(message["random_event"].text);
-    state.grid_price = message["grid_price"].number;
+    const Value& event = message.has("random_event") ? message["random_event"] : message["event"];
+    state.event = eventFromString(allText(event));
+    state.grid_price = message.has("grid_cost") ? message["grid_cost"].number : message["grid_price"].number;
     for (const Value& load : message["loads"].items) {
         Building building;
         building.type = buildingTypeFromString(load["type"].text);
@@ -297,6 +305,8 @@ HourState toHourState(const Value& message) {
 std::string toJson(const HourPlan& plan) {
     std::ostringstream out;
     out.precision(10); // whole numbers still print without a decimal point
+    double total_solar = 0.0;
+    double total_battery = 0.0;
     out << "{\"buildings\": [";
     for (std::size_t i = 0; i < plan.supplies.size(); ++i) {
         const Supply& supply = plan.supplies[i];
@@ -304,8 +314,12 @@ std::string toJson(const HourPlan& plan) {
         out << "{\"solar\": " << supply.solar
             << ", \"battery\": " << supply.battery
             << ", \"grid\": " << supply.grid << "}";
+        total_solar += supply.solar;
+        total_battery += supply.battery;
     }
-    out << "], \"generator\": " << plan.generator << "}";
+    out << "], \"solar\": " << total_solar
+        << ", \"battery\": " << total_battery
+        << ", \"generator\": " << plan.generator << "}";
     return out.str();
 }
 
