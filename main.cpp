@@ -1,3 +1,7 @@
+#include <netinet/in.h>  // sockaddr_in, htons, htonl, INADDR_LOOPBACK
+#include <sys/socket.h>  // socket, connect, send, recv
+#include <unistd.h>      // close
+
 #include <algorithm>
 #include <cctype>   // std::isspace, std::isdigit
 #include <cstdlib>  // std::strtod
@@ -294,7 +298,84 @@ std::string toJson(const HourPlan& plan) {
 
 }
 
+// talks to the simulation server over tcp
+// no destructor (rule of zero): main() calls disconnect() at the end of the day,
+// operating system closes the socket if the program exits early
+// reference - beej's guide to network programming https://beej.us/guide/bgnet/html/#a-simple-stream-client
+class ServerConnection {
+private:
+    int socket_ = -1;
+public:
+    // returns false if the server can't be reached
+    bool connect(int port) {
+        socket_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 (localhost)
+        // connect() takes a generic sockaddr*;
+        return socket_ >= 0 && ::connect(socket_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
+    }
+
+    void disconnect() { ::close(socket_); }
+
+    // reads one complete json object by matching braces, so it works whether or
+    // not the server ends messages with a newline. messages are small, so it
+    // reads one byte at a time. returns false once the server disconnects
+    bool receive(std::string& message) {
+        message.clear();
+        int depth = 0; // how many '{' are open
+        bool in_string = false; // braces inside "..." don't count
+        char c;
+        while (::recv(socket_, &c, 1, 0) == 1) {
+            if (message.empty() && c != '{') continue; // skip whitespace between messages
+            message += c;
+            if (c == '"') in_string = !in_string;
+            else if (!in_string && c == '{') ++depth;
+            else if (!in_string && c == '}' && --depth == 0) return true;
+        }
+        return false;
+    }
+
+    // returns false if the reply couldn't be sent
+    bool send(const std::string& message) {
+        std::string line = message + "\n";
+        return ::send(socket_, line.data(), line.size(), 0) == static_cast<ssize_t>(line.size());
+    }
+};
+
+// #6 main: one reply per hourly message until the server disconnects
 int main() {
-    std::cout << "hello world!\n";
+    ServerConnection server;
+    if (!server.connect(config::server_port)) {
+        std::cerr << "error: could not connect to the server on port " << config::server_port << "\n";
+        return 1;
+    }
+
+    Controller controller;
+    std::string message;
+    while (server.receive(message)) {
+        json::Value parsed;
+        if (!json::parse(message, parsed)) {
+            std::cerr << "could not parse message: " << message << "\n";
+            continue;
+        }
+        if (!parsed.has("loads")) {
+            std::cerr << "server: " << message << "\n";
+            continue;
+        }
+
+        HourPlan plan = controller.planHour(json::toHourState(parsed));
+        std::string reply = json::toJson(plan);
+        std::cerr << "<- " << message << "\n-> " << reply << "\n";
+
+        if (!server.send(reply)) {
+            std::cerr << "error: could not send reply\n";
+            server.disconnect();
+            return 1;
+        }
+    }
+
+    server.disconnect();
     return 0;
 }
