@@ -1,5 +1,10 @@
 #include <algorithm>
+#include <cctype>   // std::isspace, std::isdigit
+#include <cstdlib>  // std::strtod
 #include <iostream>
+#include <map>
+#include <sstream>  // std::ostringstream
+#include <string>
 #include <vector>
 
 // ive divided my code into sections, the first part will be setup related stuffs
@@ -8,6 +13,7 @@
 
 // pascal case for structs/enums
 // ideally snake case for variables
+// camel case for class methods
 
 // #1 Compile-time constants
 namespace config
@@ -121,6 +127,172 @@ class Controller {
             return plan;
         }
 };
+
+namespace json 
+{
+
+// parsed json value
+struct Value {
+    double number = 0;
+    std::string text;
+    std::vector<Value> items;
+    std::map<std::string, Value> fields;
+
+    bool has(const std::string& key) const { return fields.count(key) > 0; };
+
+    // handles empty values
+    const Value& operator[](const std::string& key) const {
+        static const Value empty;
+        auto it = fields.find(key);
+        return it == fields.end() ? empty : it->second;
+    }
+
+};
+
+// recursive descent parser, c++11
+// referenced from https://github.com/dropbox/json11/blob/master/json11.cpp
+// and https://www.json.org/json-en.html
+class Parser {
+private:
+    const std::string& text_;
+    std::size_t pos_ = 0;
+    bool failed_ = false;
+
+    // returns the next non white space character without consuming, null terminated at the end. i.e. \0
+    char peek() {
+        while (pos_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[pos_]))) ++pos_;
+        return pos_ < text_.size() ? text_[pos_] : '\0';
+    }
+
+    void expect(char c) {
+        if (peek() == c) ++pos_;
+        else failed_ = true;
+    }
+
+    bool consumeWord(const std::string& word) {
+        if (text_.compare(pos_, word.size(), word) != 0) return false;
+        pos_ += word.size();
+        return true;
+    }
+
+    Value parseValue() {
+        Value v;
+        char c = peek();
+        if (c == '{') v.fields = parseObject();
+        else if (c == '[') v.items = parseArray();
+        else if (c == '"') v.text = parseString();
+        else if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) v.number = parseNumber();
+        else if (!consumeWord("true") && !consumeWord("false") && !consumeWord("null")) failed_ = true;
+        return v;
+    }
+
+    std::map<std::string, Value> parseObject() {
+        std::map<std::string, Value> fields;
+        expect('{');
+        while (!failed_ && peek() != '}') {
+            if (!fields.empty()) expect(',');
+            std::string key = parseString();
+            expect(':');
+            fields[key] = parseValue();
+        }
+        expect('}');
+        return fields;
+    }
+
+    std::vector<Value> parseArray() {
+        std::vector<Value> items;
+        expect('[');
+        while (!failed_ && peek() != ']') {
+            if (!items.empty()) expect(',');
+            items.push_back(parseValue());
+        }
+        expect(']');
+        return items;
+    }
+
+    std::string parseString() {
+        expect('"');
+        size_t end = text_.find('"', pos_);  // the server's strings contain no escaped quotes
+        if (failed_ || end == std::string::npos) {
+            failed_ = true;
+            return "";
+        }
+        std::string out = text_.substr(pos_, end - pos_);
+        pos_ = end + 1;
+        return out;
+    }
+
+    double parseNumber() {
+        const char* start = text_.c_str() + pos_;
+        char* end = nullptr;
+        double value = std::strtod(start, &end);
+        if (end == start) failed_ = true;
+        pos_ += end - start;
+        return value;
+    }
+public:
+    explicit Parser(const std::string& text) : text_(text) {}
+
+    // returns false if the text isn't valid json
+    bool parse(Value& result) {
+        result = parseValue();
+        return !failed_;
+    }
+};
+
+bool parse(const std::string& text, Value& result) { return Parser(text).parse(result); }
+
+Event eventFromString(const std::string& name) {
+    if (name == "cloudy_weather") return Event::Cloudy;
+    if (name == "generator_failure") return Event::GeneratorFailure;
+    if (name == "battery_failure") return Event::BatteryFailure;
+    if (name == "grid_failure") return Event::GridFailure;
+    if (name != "none") std::cerr << "WARNING: unknown event '" << name << "'\n";
+    return Event::None;
+}
+
+// an unknown type is treated as a lecture hall: it gets no solar,
+// so the reply stays valid whatever the building really is
+BuildingType buildingTypeFromString(const std::string& name) {
+    if (name == "library") return BuildingType::Library;
+    if (name == "laboratory") return BuildingType::Laboratory;
+    if (name == "student_centre") return BuildingType::StudentCentre;
+    if (name == "student_residence") return BuildingType::StudentResidence;
+    if (name != "lecture_hall") std::cerr << "WARNING: unknown building type '" << name << "'\n";
+    return BuildingType::LectureHall;
+}
+
+// turns one server message into the controller's input
+HourState toHourState(const Value& message) {
+    HourState state;
+    state.event = eventFromString(message["random_event"].text);
+    state.grid_price = message["grid_price"].number;
+    for (const Value& load : message["loads"].items) {
+        Building building;
+        building.type = buildingTypeFromString(load["type"].text);
+        building.load = load["load"].number;
+        state.buildings.push_back(building);
+    }
+    return state;
+}
+
+// turns the controller's plan into the reply the server expects
+std::string toJson(const HourPlan& plan) {
+    std::ostringstream out;
+    out.precision(10); // whole numbers still print without a decimal point
+    out << "{\"buildings\": [";
+    for (std::size_t i = 0; i < plan.supplies.size(); ++i) {
+        const Supply& supply = plan.supplies[i];
+        if (i > 0) out << ", ";
+        out << "{\"solar\": " << supply.solar
+            << ", \"battery\": " << supply.battery
+            << ", \"grid\": " << supply.grid << "}";
+    }
+    out << "], \"generator\": " << plan.generator << "}";
+    return out.str();
+}
+
+}
 
 int main() {
     std::cout << "hello world!\n";
