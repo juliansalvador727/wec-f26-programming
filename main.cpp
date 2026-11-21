@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <iostream>
 #include <vector>
 
@@ -50,6 +51,37 @@ struct Supply {
 struct HourPlan {
     std::vector<Supply> supplies;
     double generator = 0;
+};
+
+// #3 our controller class
+class Controller {
+    private:
+        double battery_charge_ = 0;
+        int hour_ = 0;
+
+        bool isLastHour() const { return hour_ == config::hours_per_day - 1; }
+
+        bool shouldUseBattery(const HourState& state) const {
+            Event event = state.event;
+            double price = state.grid_price;
+            if (event == Event::BatteryFailure) return false;
+            if (event == Event::GridFailure) return true;
+            if (isLastHour()) return true;
+            if (event == Event::GeneratorFailure) return false;
+            return price > config::generator_cost;
+        }
+
+        bool shouldRecharge(const HourState& state) const {
+            Event event = state.event;
+            return event != Event::GeneratorFailure && !isLastHour();
+        }
+        double draw(double& available, double& needed) {
+            double amount = std::min(available, needed);
+            available -= amount;
+            needed -= amount;
+            return amount;
+        }
+    public:
 };
 
 int main() {
