@@ -75,13 +75,51 @@ class Controller {
             Event event = state.event;
             return event != Event::GeneratorFailure && !isLastHour();
         }
-        double draw(double& available, double& needed) {
+        static double draw(double& available, double& needed) {
             double amount = std::min(available, needed);
             available -= amount;
             needed -= amount;
             return amount;
         }
     public:
+        HourPlan planHour(const HourState& state) {
+            Event event = state.event;
+
+            double solar_left = config::solar_per_hour;
+            double battery_left = battery_charge_;
+
+            if (event == Event::Cloudy) {
+                solar_left = 0;
+            }
+            if (!shouldUseBattery(state)) {
+                battery_left = 0;
+            }
+
+            HourPlan plan;
+            double unmet = 0;
+            for (const auto& building : state.buildings) {
+                double need = building.load;
+                Supply supply;
+                if (building.canUseSolar()) {
+                    supply.solar = draw(solar_left, need);
+                }
+                supply.battery = draw(battery_left, need);
+                if (event != Event::GridFailure) {
+                    supply.grid = need;
+                    need = 0;
+                }
+                plan.supplies.push_back(supply);
+                battery_charge_ -= supply.battery;
+                unmet += need;
+            }
+            if (unmet > 1e-9) std::cerr << "[hour " << hour_ << "] WARNING: unmet demand " << unmet << "\n";
+            if (shouldRecharge(state)) {
+                plan.generator = config::battery_capacity - battery_charge_;
+            }
+            battery_charge_ += plan.generator;
+            ++hour_;
+            return plan;
+        }
 };
 
 int main() {
